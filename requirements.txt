@@ -2,5 +2,7 @@ netaddr
 argparse
 boto
 pydot
-pyparsing
+pyparsing >= 2.1.4
 wsgiref
+nose
+tornado
