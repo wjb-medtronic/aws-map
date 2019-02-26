@@ -18,60 +18,6 @@ secGrpToDraw = set()
 colours = ['azure', 'coral', 'wheat', 'deepskyblue', 'firebrick', 'gold', 'green', 'plum', 'salmon', 'sienna']
 
 
-class RetryLimitExceeded(Exception):
-    def __init__(self, exception, retries):
-        self.exception = exception
-        self.tries = retries
-
-    def __str__(self):
-        return repr(
-            "Throttling retry limit exceeded, no_of_tries(%s), last exception: %s" % (self.tries, self.exception))
-
-
-def get_api_error_code(exception):
-    if hasattr(exception, "body"):
-        if exception.body is not None and hasattr(exception.body, "split"):
-            code = exception.body.split("<Code>")[1]
-            code = code.split("</Code>")[0]
-            return code
-        else:
-            return ""
-    else:
-        return ""
-
-
-def paginate_boto_response(api_call, *args, **kwargs):
-    resultset = []
-    tries = 0
-    retry_interval = 2
-    retry = 10
-    while True:
-
-        tries += 1
-        try:
-            results = api_call(*args, **kwargs)
-            if results:
-                resultset += results
-                if results.next_token:
-                    kwargs['next_token'] = results.next_token
-                else:
-                    break
-            else:
-                break
-        except Exception, e:
-            last_exception = e
-            code = get_api_error_code(e)
-            if retry <= 0:
-                raise RetryLimitExceeded(last_exception, tries)
-            elif retry > 0 and (code == "Throttling" or code == "RequestLimitExceeded"):
-                retry -= 1
-                retry_interval += 1
-                time.sleep(retry_interval)
-            else:
-                raise e
-
-    return resultset
-
 ###############################################################################
 ###############################################################################
 ###############################################################################
@@ -414,26 +360,21 @@ class Subnet(Dot):
 
     def drawSec(self, fh):
         fh.write('// Subnet %s\n' % self.name)
-        englishname =''
-        for t in self.data['Tags']:
-            if t['Key'] == 'Name':
-                englishname = t['Value']
+        englishname = self.tags('Name')
+        if englishname is None:
+            englishname =''
         fh.write('%s [label="%s\\n%s\\n%s" %s];\n' % (self.mn(self.name), self.name, self.data['CidrBlock'], englishname,self.image()))
         self.connect(fh, self.name, self.data['VpcId'])
 
     def draw(self, fh):
         if not self.inVpc(self.args.vpc) or not self.inSubnet(self.args.subnet):
             return
-        if 'Name' in self.data['Tags']:
-            label = self.data['Tags']['Name']
-        else:
-            label = self.name
+        label = self.name
 
         fh.write('// Subnet %s\n' % self.name)
-        englishname =''
-        for t in self.data['Tags']:
-            if t['Key'] == 'Name':
-                englishname = t['Value']
+        englishname = self.tags('Name')
+        if englishname is None:
+            englishname = ''
         fh.write('%s [label="%s\\n%s\\n%s" %s];\n' % (self.mn(self.name), label, self.data['CidrBlock'], englishname, self.image()))
         self.connect(fh, self.name, self.data['VpcId'])
 
@@ -511,22 +452,15 @@ class SecurityGroup(Dot):
         self.args = args
         self.drawn = False
 
+    def inVpc( self, vpc ):
+        if self.data['VpcId'] == vpc:
+            return True
+        return False
+
     def draw(self, fh):
-        if self.args.vpc and self.data['VpcId'] != self.args.vpc:
+        if not self.inVpc( self.args.vpc ):
             return
-
         return self.drawSec( fh )
-        # portstr = self.permstring(fh, self.data['IpPermissions'])
-        # eportstr = self.permstring(fh, self.data['IpPermissionsEgress'])
-
-        # tportstr = []
-        # if portstr:
-        #     tportstr.append("Ingress: %s" % portstr)
-        # if eportstr:
-        #     tportstr.append("Egress: %s" % eportstr)
-        # desc = "\\n".join(chunkstring(self.data['Description'], 20))
-        # fh.write('%s [label="SG: %s\\n%s\\n%s" %s];\n' % (
-        #     self.mn(self.name), self.name, desc, "\\n".join(tportstr), self.image())) 
 
     def drawSec(self, fh):
         global clusternum
@@ -538,9 +472,9 @@ class SecurityGroup(Dot):
         desc = "\\n".join(chunkstring(self['Description'], 20))
         fh.write('%s [shape="rect", label="%s\\n%s"]\n' % (self.mn(), self.name, desc))
         if 'IpPermissions' in self.data and self.data['IpPermissions']:
-            self.genRuleBlock(self.data['IpPermissions'], 'ingress', fh)
+            self.genRuleBlock(self.data['IpPermissions'], 'ingress', fh, True)
         if 'IpPermissionsEgress' in self.data and self.data['IpPermissionsEgress']:
-            self.genRuleBlock(self.data['IpPermissionsEgress'], 'egress', fh)
+            self.genRuleBlock(self.data['IpPermissionsEgress'], 'egress', fh, False)
         clusternum += 1
         fh.write("}\n")
 
@@ -552,7 +486,7 @@ class SecurityGroup(Dot):
             fh.write(r)
         self.drawn = True
 
-    def genRuleBlock(self, struct, direct, fh):
+    def genRuleBlock(self, struct, direct, fh, ingress):
         fh.write("// SG %s %s\n" % (self.name, direct))
         for e in struct:
             fh.write("// %s\n" % e)
@@ -595,7 +529,12 @@ class SecurityGroup(Dot):
             if e['UserIdGroupPairs']:
                 for pair in e['UserIdGroupPairs']:
                     secGrpToDraw.add(pair['GroupId'])
-                    self.extraRules.append('%s_%s_rules -> %s;\n' % (self.mn(), direct, self.mn(pair['GroupId'])))
+                    if self.name == pair['GroupId']:
+                        continue
+                    if ingress:
+                        self.extraRules.append('%s -> %s_%s_rules [ color=blue ];\n' % (self.mn(pair['GroupId']), self.mn(), direct ))
+                    else:
+                        self.extraRules.append('%s_%s_rules -> %s [ color=blue ];\n' % (self.mn(), direct, self.mn(pair['GroupId'])))
 
     def relevent_to_ip(self, ip):
         for i in self['IpPermissions']:
@@ -637,6 +576,9 @@ class SecurityGroup(Dot):
                 iprangestr = ';'.join(ipranges)
                 ans.append("%s %s->%s/%s\\n" % (iprangestr, ip['FromPort'], ip['ToPort'], ip['IpProtocol']))
         return " ".join(ans)
+    def rank(self, fh):
+        if self.inVpc(self.args.vpc) :
+            fh.write("%s;" % self.mn())
 
 
 ###############################################################################
@@ -1177,9 +1119,6 @@ def chunkstring(strng, length):
 def get_all_internet_gateways(args):
     if args.verbose:
         sys.stderr.write("Getting internet gateways\n")
-    # igw_data = ec2cmd("describe-internet-gateways")['InternetGateways']
-#    import boto.vpc
-#    igw_data = paginate_boto_response(boto.vpc.connect_to_region(args.region).get_all_internet_gateways)
     client = boto3.client('ec2', region_name=args.region)
     igw_data = client.describe_internet_gateways()
     for igw in igw_data['InternetGateways']:
@@ -1189,9 +1128,6 @@ def get_all_internet_gateways(args):
 
 ###############################################################################
 def get_vpc_list(args):
-#    import boto.vpc
-#    vpc_data = paginate_boto_response(boto.vpc.connect_to_region(args.region).get_all_vpcs)
-    #vpc_data = ec2cmd("describe-vpcs")['Vpcs']
     client = boto3.client('ec2', region_name=args.region)
     vpc_data = client.describe_vpcs()
     for vpc in vpc_data['Vpcs']:
@@ -1207,9 +1143,6 @@ def get_vpc_list(args):
 def get_all_instances(args):
     if args.verbose:
         sys.stderr.write("Getting instances\n")
-#    import boto.ec2
-#    reservation_list = paginate_boto_response(boto.ec2.connect_to_region(args.region).get_all_reservations)
-    # reservation_list = ec2cmd("describe-instances")['Reservations']
     client = boto3.client('ec2', region_name=args.region)
     reservation_list = client.describe_instances()
     for reservation in reservation_list['Reservations']:
@@ -1224,8 +1157,6 @@ def get_all_instances(args):
 def get_all_subnets(args):
     if args.verbose:
         sys.stderr.write("Getting subnets\n")
-    #import boto.vpc
-    #subnets = paginate_boto_response(boto.vpc.connect_to_region(args.region).get_all_subnets)
     client = boto3.client('ec2', region_name=args.region)
     subnets = client.describe_subnets()
     for subnet in subnets['Subnets']:
@@ -1242,7 +1173,7 @@ def get_all_volumes(args):
     if args.verbose:
         sys.stderr.write("Getting volumes\n")
     # volumes = ec2cmd("describe-volumes")['Volumes']
-    volumes = paginate_boto_response(boto.ec2.connect_to_region(args.region).get_all_volumes)
+    # volumes = paginate_boto_response(boto.ec2.connect_to_region(args.region).get_all_volumes)
     for volume in volumes:
         v = Volume(volume, args)
         objects[v.name] = v
@@ -1252,12 +1183,8 @@ def get_all_volumes(args):
 def get_all_security_groups(args):
     if args.verbose:
         sys.stderr.write("Getting security groups\n")
-#    import boto.ec2
-#    sgs = paginate_boto_response(boto.ec2.connect_to_region(args.region).get_all_security_groups)
     client = boto3.client('ec2', region_name=args.region)
     sgs = client.describe_security_groups()
-
-    # sgs = ec2cmd("describe-security-groups")['SecurityGroups']
     for sg in sgs['SecurityGroups']:
         s = SecurityGroup(sg, args)
         objects[s.name] = s
@@ -1269,9 +1196,6 @@ def get_all_security_groups(args):
 def get_all_route_tables(args):
     if args.verbose:
         sys.stderr.write("Getting route tables\n")
-    # rts = ec2cmd('describe-route-tables')['RouteTables']
-#    import boto.vpc
-#    rts = paginate_boto_response(boto.vpc.connect_to_region(args.region).get_all_route_tables)
     client = boto3.client('ec2', region_name=args.region)
     rts = client.describe_route_tables()
     for rt in rts['RouteTables']:
@@ -1283,9 +1207,6 @@ def get_all_route_tables(args):
 def get_all_network_interfaces(args):
     if args.verbose:
         sys.stderr.write("Getting NICs\n")
-#    import boto.ec2
-#    nics = paginate_boto_response(boto.ec2.connect_to_region(args.region).get_all_network_interfaces)
-    # nics = ec2cmd('describe-network-interfaces')['NetworkInterfaces']
     client = boto3.client('ec2', region_name=args.region)
     nics = client.describe_network_interfaces()
     for nic in nics['NetworkInterfaces']:
@@ -1311,9 +1232,6 @@ def get_all_rds(args):
 def get_all_elbs(args):
     if args.verbose:
         sys.stderr.write("Getting Load Balancers\n")
-#    import boto.ec2.elb
-#    elbs = paginate_boto_response(boto.ec2.elb.connect_to_region(args.region).get_all_load_balancers)
-    # elbs = elbcmd('describe-load-balancers')['LoadBalancerDescriptions']
     client = boto3.client('elbv2')
     elbs = client.describe_load_balancers()
     for elb in elbs['LoadBalancers']:
@@ -1327,9 +1245,6 @@ def get_all_elbs(args):
 def get_all_networkacls(args):
     if args.verbose:
         sys.stderr.write("Getting NACLs\n")
-#    import boto.vpc
-#    nacls = paginate_boto_response(boto.vpc.connect_to_region(args.region).get_all_network_acls)
-    # nacls = ec2cmd('describe-network-acls')['NetworkAcls']
     client = boto3.client('ec2', region_name=args.region)
     nacls = client.describe_network_acls()
     for nacl in nacls['NetworkAcls']:
@@ -1343,9 +1258,6 @@ def get_all_networkacls(args):
 def get_all_asgs(args):
     if args.verbose:
         sys.stderr.write("Getting ASGs\n")
-    # asgs = asgcmd('describe-auto-scaling-groups')['AutoScalingGroups']
-#    import boto.ec2.autoscale
-#    asgs = paginate_boto_response(boto.ec2.autoscale.connect_to_region(args.region).get_all_groups)
     client = boto3.client('autoscaling')
     asgs = client.describe_auto_scaling_groups()
     for asg in asgs['AutoScalingGroups']:
@@ -1373,7 +1285,6 @@ def map_region(args):
 
     # # ELB
     get_all_elbs(args)
-
     get_all_asgs(args)
 
 
@@ -1505,7 +1416,7 @@ def generate_map(fh, args):
         obj.draw(fh)
 
     # Assign Ranks
-    for objtype in [Database, LoadBalancer, Subnet, Instance, VPC, InternetGateway, RouteTable, ASG]:
+    for objtype in [Database, LoadBalancer, Subnet, Instance, VPC, InternetGateway, RouteTable, ASG, SecurityGroup]:
         fh.write('// Rank %s\n' % objtype.__name__)
         fh.write('rank_%s [style=invisible]\n' % objtype.__name__)
         fh.write('{ rank=same; rank_%s; ' % objtype.__name__)
@@ -1513,7 +1424,7 @@ def generate_map(fh, args):
             if obj.__class__ == objtype:
                 obj.rank(fh)
         fh.write('}\n')
-    ranks = ['RouteTable', 'Subnet', 'Database', 'LoadBalancer', 'ASG', 'Instance', 'VPC', 'InternetGateway']
+    ranks = ['RouteTable', 'Subnet', 'Database', 'LoadBalancer', 'ASG', 'Instance', 'VPC', 'InternetGateway', 'SecurityGroup']
     strout = " -> ".join(["rank_%s" % x for x in ranks])
     fh.write("%s [style=invis];\n" % strout)
 
